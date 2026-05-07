@@ -1,0 +1,10 @@
+build/
+third_party/
+certs/
+src/certs_gen.h
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
