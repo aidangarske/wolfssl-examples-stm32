@@ -1,6 +1,8 @@
 # wolfIP STM32 CubeMX Example
 
-This directory contains the wolfIP CMSIS pack for STM32CubeMX. The pack provides a portable TCP/IP stack that works on any STM32 microcontroller with Ethernet.
+This directory contains a pre-configured STM32CubeMX project that uses the wolfIP CMSIS pack — a portable TCP/IP stack that works on any STM32 microcontroller with Ethernet.
+
+The wolfIP CMSIS pack is hosted at wolfSSL: <https://www.wolfssl.com/files/ide/wolfSSL.I-CUBE-wolfIP.1.0.0.pack>
 
 ## Supported Boards
 
@@ -14,11 +16,10 @@ Any STM32 with Ethernet peripheral:
 
 ### Step 1: Install the Pack
 
-1. Open STM32CubeMX
-2. Go to **Help → Manage Embedded Software Packages**
-3. Click **From Local...**
-4. Select `wolfSSL.I-CUBE-wolfIP.1.0.0.pack` from this directory
-   - Or download the latest from [wolfSSL](https://www.wolfssl.com/files/ide/I-CUBE-wolfIP.pack)
+1. Download the wolfIP pack from <https://www.wolfssl.com/files/ide/wolfSSL.I-CUBE-wolfIP.1.0.0.pack>
+2. Open STM32CubeMX
+3. Go to **Help → Manage Embedded Software Packages**
+4. Click **From Local...** and select the downloaded `wolfSSL.I-CUBE-wolfIP.1.0.0.pack`
 5. Accept the license agreement
 
 ### Step 2: Create Your Project
