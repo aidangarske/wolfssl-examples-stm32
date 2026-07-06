@@ -384,6 +384,130 @@ cleanup:
 }
 #endif /* HAVE_AES_ECB || WOLFSSL_AES_DIRECT */
 
+#if defined(HAVE_AES_CBC)
+/* [5] Transparent AES-CBC via the STM32 DHUK device. Validates the fix that
+ * routes CBC through the crypto-callback: previously CBC bypassed it and
+ * silently used the 256-bit seed as a raw AES key. Discriminating check: for a
+ * single block with IV = 0, CBC(P) == ECB(P) ONLY when both use the same
+ * SAES-derived key -- the old seed-as-key path would not match ECB's derived
+ * key. Also confirms that a DHUK AES-CTR call (a mode the SAES backend cannot
+ * service) now returns a hard error instead of silently using the seed. */
+static int test_dhuk_cryptocb_cbc(void)
+{
+    static const byte seedA[32] = {
+        0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
+        0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,
+        0x10,0x32,0x54,0x76,0x98,0xba,0xdc,0xfe,
+        0xef,0xcd,0xab,0x89,0x67,0x45,0x23,0x01
+    };
+    static const byte pt[16] = {
+        0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,
+        0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a
+    };
+    static const byte zero_iv[16] = { 0 };
+    Aes  aes;
+    byte ctEcb[16];
+    byte ctCbc[16];
+    byte rt[16];
+    int  ret;
+
+    ret = wc_Stm32_DhukRegister(WC_DHUK_DEVID);
+    if (ret != 0) {
+        printf("  DHUK register failed: %d\n", ret);
+        return ret;
+    }
+
+    /* ECB reference: ctEcb = ECB_k(pt) with the SAES-derived key. */
+    ret = wc_AesInit(&aes, NULL, WC_DHUK_DEVID);
+    if (ret == 0) {
+        ret = wc_AesSetKey(&aes, seedA, 32, NULL, AES_ENCRYPTION);
+    }
+    if (ret == 0) {
+        ret = wc_AesEcbEncrypt(&aes, ctEcb, pt, (word32)sizeof(pt));
+    }
+    wc_AesFree(&aes);
+    if (is_expected_gated(ret)) {
+        printf("  cryptocb CBC reachable; backend gated/unavailable (ret=%d)\n",
+               ret);
+        ret = 0; /* soft-PASS */
+        goto cleanup;
+    }
+    if (ret != 0) {
+        printf("  ECB reference failed: %d\n", ret);
+        goto cleanup;
+    }
+
+    /* CBC with IV = 0, single block: must equal the ECB reference. */
+    ret = wc_AesInit(&aes, NULL, WC_DHUK_DEVID);
+    if (ret == 0) {
+        ret = wc_AesSetKey(&aes, seedA, 32, zero_iv, AES_ENCRYPTION);
+    }
+    if (ret == 0) {
+        ret = wc_AesCbcEncrypt(&aes, ctCbc, pt, (word32)sizeof(pt));
+    }
+    wc_AesFree(&aes);
+    if (ret != 0) {
+        printf("  cryptocb CBC encrypt failed: %d\n", ret);
+        goto cleanup;
+    }
+    if (XMEMCMP(ctEcb, ctCbc, 16) != 0) {
+        printf("  cryptocb CBC != ECB(IV=0) -- FAIL "
+               "(CBC not using the SAES-derived key)\n");
+        ret = -1;
+        goto cleanup;
+    }
+    printf("  cryptocb CBC matches ECB(IV=0) OK (SAES-derived key drives CBC)\n");
+
+    /* CBC round-trip: decrypt recovers plaintext. */
+    ret = wc_AesInit(&aes, NULL, WC_DHUK_DEVID);
+    if (ret == 0) {
+        ret = wc_AesSetKey(&aes, seedA, 32, zero_iv, AES_DECRYPTION);
+    }
+    if (ret == 0) {
+        ret = wc_AesCbcDecrypt(&aes, rt, ctCbc, (word32)sizeof(ctCbc));
+    }
+    wc_AesFree(&aes);
+    if (ret != 0) {
+        printf("  cryptocb CBC decrypt failed: %d\n", ret);
+        goto cleanup;
+    }
+    if (XMEMCMP(pt, rt, 16) != 0) {
+        printf("  cryptocb CBC round-trip mismatch -- FAIL\n");
+        ret = -1;
+        goto cleanup;
+    }
+    printf("  cryptocb CBC round-trip OK\n");
+
+#ifdef WOLFSSL_AES_COUNTER
+    /* Negative: AES-CTR is not serviceable for a DHUK key. It must now return a
+     * hard error (ALGO_ID_E) rather than silently encrypting with the seed as a
+     * raw key. */
+    ret = wc_AesInit(&aes, NULL, WC_DHUK_DEVID);
+    if (ret == 0) {
+        ret = wc_AesSetKey(&aes, seedA, 32, zero_iv, AES_ENCRYPTION);
+    }
+    if (ret == 0) {
+        ret = wc_AesCtrEncrypt(&aes, rt, pt, (word32)sizeof(pt));
+    }
+    wc_AesFree(&aes);
+    if (ret == ALGO_ID_E) {
+        printf("  cryptocb CTR on DHUK key rejected (ALGO_ID_E) OK\n");
+        ret = 0;
+    }
+    else {
+        printf("  cryptocb CTR on DHUK key NOT rejected (ret=%d) -- FAIL\n", ret);
+        ret = -1;
+        goto cleanup;
+    }
+#endif /* WOLFSSL_AES_COUNTER */
+    ret = 0;
+
+cleanup:
+    wc_Stm32_DhukUnRegister(WC_DHUK_DEVID);
+    return ret;
+}
+#endif /* HAVE_AES_CBC */
+
 #if defined(HAVE_ECC) && defined(WOLFSSL_STM32_PKA)
 /* [4] ECDSA sign with a DHUK-protected private key via the normal
  * wc_ecc_sign_hash API. Self-bootstrap: make a P-256 keypair, ECB-encrypt
@@ -581,6 +705,12 @@ int main(void)
         if (ret == 0) {
             printf("\n[3] AES-ECB via transparent DHUK crypto-callback:\n");
             ret = test_dhuk_cryptocb_ecb();
+        }
+#endif
+#if defined(HAVE_AES_CBC)
+        if (ret == 0) {
+            printf("\n[5] AES-CBC via transparent DHUK crypto-callback:\n");
+            ret = test_dhuk_cryptocb_cbc();
         }
 #endif
 #if defined(HAVE_ECC) && defined(WOLFSSL_STM32_PKA)
