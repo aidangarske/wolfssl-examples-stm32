@@ -834,6 +834,13 @@ extern "C" {
  * PBKDF, cert/key generation and the error-string table. SHA-256 stays because
  * the software Hash-DRBG (used to seed ECC keygen) depends on it. */
 #ifdef STM32_BARE_CB_ONLY
+    /* True callback-only AES: strip the software AES block primitive so every
+     * AES op must route through the crypto callback (no SW fallback). Relies on
+     * the wolfSSL aes.c guard that lets the STM32 bare AES path defer to
+     * WOLF_CRYPTO_CB_ONLY_AES. WOLF_CRYPTO_CB_ONLY_ECC is deliberately NOT set:
+     * the DHUK callback has no ECDSA verify / plain-key keygen handler yet, so
+     * enabling it breaks the ECDSA leg (NO_VALID_DEVID) -- open wolfSSL work. */
+    #define WOLF_CRYPTO_CB_ONLY_AES
     #define NO_RSA
     #define NO_DH
     #undef  WOLFSSL_SP_4096
