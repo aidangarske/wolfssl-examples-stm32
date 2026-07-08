@@ -834,13 +834,22 @@ extern "C" {
  * PBKDF, cert/key generation and the error-string table. SHA-256 stays because
  * the software Hash-DRBG (used to seed ECC keygen) depends on it. */
 #ifdef STM32_BARE_CB_ONLY
-    /* True callback-only AES: strip the software AES block primitive so every
-     * AES op must route through the crypto callback (no SW fallback). Relies on
-     * the wolfSSL aes.c guard that lets the STM32 bare AES path defer to
-     * WOLF_CRYPTO_CB_ONLY_AES. WOLF_CRYPTO_CB_ONLY_ECC is deliberately NOT set:
-     * the DHUK callback has no ECDSA verify / plain-key keygen handler yet, so
-     * enabling it breaks the ECDSA leg (NO_VALID_DEVID) -- open wolfSSL work. */
+    /* True callback-only: strip the software AES and ECC implementations so
+     * every AES/ECC op must route through the crypto callback (no SW fallback).
+     * AES relies on the wolfSSL aes.c guard that lets the STM32 bare AES path
+     * defer to WOLF_CRYPTO_CB_ONLY_AES; ECC relies on the DHUK callback's ECDSA
+     * sign + verify handlers (verify -> HW PKA). main_cbonly.c must use a fixed
+     * key (no wc_ecc_make_key) since keygen has no device path here. Note: on a
+     * sign-only-PKA part (c5a3, WC_STM32_PKA_SIGN_ONLY) there is no HW verify,
+     * so WOLF_CRYPTO_CB_ONLY_ECC would break verify there -- keep it to full-PKA
+     * boards (u3, u585, u545). */
     #define WOLF_CRYPTO_CB_ONLY_AES
+    /* Callback-only ECC only on full-PKA parts. The C5 PKA is sign-only
+     * (WC_STM32_PKA_SIGN_ONLY) with no HW ECDSA verify, so stripping software
+     * ECC there would leave verify with no implementation. */
+    #ifndef WOLFSSL_STM32C5
+        #define WOLF_CRYPTO_CB_ONLY_ECC
+    #endif
     #define NO_RSA
     #define NO_DH
     #undef  WOLFSSL_SP_4096

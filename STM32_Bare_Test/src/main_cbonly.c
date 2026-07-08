@@ -43,6 +43,11 @@ extern void     SystemCoreClockUpdate(void);
 #include "wolfssl/wolfcrypt/hmac.h"
 #include "wolfssl/wolfcrypt/port/st/stm32.h"
 
+/* Fixed NIST P-256 CAVP keypair + hash (private SigGen_D, public SigGen_Qx/Qy,
+ * SigGenHashMsg). Used so the ECDSA leg needs no wc_ecc_make_key -- a plain
+ * keygen has no software or device path under WOLF_CRYPTO_CB_ONLY_ECC. */
+#include "st_p256_vec.h"
+
 #ifndef BUILD_CONFIG_NAME
 #define BUILD_CONFIG_NAME "unknown"
 #endif
@@ -89,64 +94,43 @@ static const byte g_seed[32] = {
  * route signing through the device, then verify. */
 static int test_cbonly_ecdsa(WC_RNG* rng)
 {
-    static const byte hash[32] = {
-        0x9f,0x86,0xd0,0x81,0x88,0x4c,0x7d,0x65,
-        0x9a,0x2f,0xea,0xa0,0xc5,0x5a,0xd0,0x15,
-        0xa3,0xbf,0x4f,0x1b,0x2b,0x0b,0x82,0x2c,
-        0xd1,0x5d,0x6c,0x15,0xb0,0xf0,0x0a,0x08
-    };
-    ecc_key kp;
+    ecc_key key;
     Aes     aes;
-    byte    priv[32];
     byte    wrapped[32];
     byte    sig[80];
-    word32  privSz = (word32)sizeof(priv);
     word32  sigLen = (word32)sizeof(sig);
     int     ret;
     int     verify = 0;
     int     haveKey = 0;
 
-    ret = wc_ecc_init(&kp);
+    /* One key carries the curve + public point (for verify) and the wrapped
+     * private scalar (for sign) -- no keygen, so it works under
+     * WOLF_CRYPTO_CB_ONLY_ECC. */
+    ret = wc_ecc_init_ex(&key, NULL, WC_DHUK_DEVID);
     if (ret != 0) {
-        printf("  wc_ecc_init failed: %d\n", ret);
+        printf("  wc_ecc_init_ex failed: %d\n", ret);
         return ret;
     }
     haveKey = 1;
 
-    ret = wc_ecc_make_key_ex(rng, 32, &kp, ECC_SECP256R1);
+    /* Set curve (dp) + public point from the fixed vector. */
+    ret = wc_ecc_import_unsigned(&key, (byte*)SigGen_Qx, (byte*)SigGen_Qy,
+                                 NULL, ECC_SECP256R1);
     if (ret != 0) {
-        printf("  wc_ecc_make_key_ex failed: %d\n", ret);
-        goto cleanup;
-    }
-#ifdef WOLFSSL_STM32_CCB
-    /* On a CCB build the callback binds a hardware-protected blob during
-     * keygen; require it so a silent software-keygen fallback fails the test. */
-    if (kp.dhuk_is_ccb != 1) {
-        printf("  ERROR: CCB fell back to software keygen (dhuk_is_ccb=%d)\n",
-               kp.dhuk_is_ccb);
-        ret = -1;
-        goto cleanup;
-    }
-#endif
-
-    ret = wc_ecc_export_private_only(&kp, priv, &privSz);
-    if (ret != 0 || privSz != 32u) {
-        printf("  export scalar failed: %d (len %lu)\n", ret,
-               (unsigned long)privSz);
-        ret = (ret != 0) ? ret : -1;
+        printf("  import public point failed: %d\n", ret);
         goto cleanup;
     }
 
-    /* Wrap the scalar = ECB-encrypt with the DHUK-derived key (seed as key). */
+    /* Wrap the known private scalar with the DHUK-derived AES key, exactly as a
+     * provisioned device key would be delivered. */
     ret = wc_AesInit(&aes, NULL, WC_DHUK_DEVID);
     if (ret == 0) {
         ret = wc_AesSetKey(&aes, g_seed, 32, NULL, AES_ENCRYPTION);
     }
     if (ret == 0) {
-        ret = wc_AesEcbEncrypt(&aes, wrapped, priv, 32);
+        ret = wc_AesEcbEncrypt(&aes, wrapped, SigGen_D, 32);
     }
     wc_AesFree(&aes);
-    wc_ForceZero(priv, sizeof(priv));
     if (is_expected_gated(ret)) {
         printf("  ECDSA: DHUK backend gated/unavailable (ret=%d) -- soft PASS\n",
                ret);
@@ -158,15 +142,15 @@ static int test_cbonly_ecdsa(WC_RNG* rng)
         goto cleanup;
     }
 
-    kp.devId = WC_DHUK_DEVID;
-    ret = wc_ecc_import_wrapped_private(&kp, g_seed, (word32)sizeof(g_seed),
+    ret = wc_ecc_import_wrapped_private(&key, g_seed, (word32)sizeof(g_seed),
                                         wrapped, 32, 32);
     if (ret != 0) {
         printf("  import wrapped private failed: %d\n", ret);
         goto cleanup;
     }
 
-    ret = wc_ecc_sign_hash(hash, (word32)sizeof(hash), sig, &sigLen, rng, &kp);
+    ret = wc_ecc_sign_hash(SigGenHashMsg, (word32)sizeof(SigGenHashMsg),
+                           sig, &sigLen, rng, &key);
     if (is_expected_gated(ret)) {
         printf("  ECDSA sign gated/unavailable (ret=%d) -- soft PASS\n", ret);
         ret = 0;
@@ -177,8 +161,10 @@ static int test_cbonly_ecdsa(WC_RNG* rng)
         goto cleanup;
     }
 
-    ret = wc_ecc_verify_hash(sig, sigLen, hash, (word32)sizeof(hash),
-                             &verify, &kp);
+    /* Verify with the public point on the same key (routes to the callback's
+     * HW-PKA verify handler under WOLF_CRYPTO_CB_ONLY_ECC). */
+    ret = wc_ecc_verify_hash(sig, sigLen, SigGenHashMsg,
+                             (word32)sizeof(SigGenHashMsg), &verify, &key);
     if (ret != 0) {
         printf("  ECDSA verify error: %d\n", ret);
         goto cleanup;
@@ -193,10 +179,9 @@ static int test_cbonly_ecdsa(WC_RNG* rng)
     ret = 0;
 
 cleanup:
-    wc_ForceZero(priv, sizeof(priv));
     wc_ForceZero(wrapped, sizeof(wrapped));
     if (haveKey) {
-        wc_ecc_free(&kp);
+        wc_ecc_free(&key);
     }
     return ret;
 }
