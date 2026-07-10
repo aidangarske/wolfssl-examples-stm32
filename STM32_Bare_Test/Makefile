@@ -1,0 +1,537 @@
+# ---------------------------------------------------------------------------
+# STM32_Bare_Test - HAL-free wolfCrypt validation across STM32 boards
+#
+# Boards (BOARD=):
+#   h5    - NUCLEO-H563ZI    (HASH + RNG only; no AES on this chip)
+#   f437  - STM32437I-EVAL   (CRYP + HASH + RNG)
+#                              UART4 PC10/PC11 AF8 VCP; 144 MHz HSI->PLL.
+#                              Build-validated; silicon-on-bench pending board.
+#
+# Build flavors (CONFIG=):
+#   c     - Pure C software baseline (no STM32 HW)
+#   bare  - WOLFSSL_STM32_BARE: direct-register HW (no HAL, no StdPeriph)
+#
+# Targets (TARGET=):
+#   test  - wolfCrypt KAT/self-test
+#   bench - wolfCrypt benchmark
+#   dhuk  - DHUK ECC sign + GMAC tests (u3/u585/u545 only)
+#
+# Examples:
+#   make BOARD=h5  CONFIG=bare TARGET=test
+#   make BOARD=h5  CONFIG=bare TARGET=bench
+#   make BOARD=h5  CONFIG=c    TARGET=test
+#   make flash    BOARD=h5  CONFIG=bare TARGET=test
+#   make BOARD=u3  CONFIG=bare TARGET=dhuk flash
+#
+# Required env / make vars:
+#   WOLFSSL_ROOT     = ../../wolfssl                  (default sibling layout)
+#   STM32CUBE_FW_H5  = $(HOME)/STM32Cube/Repository/STM32Cube_FW_H5_V1.5.1
+#   STM32CUBE_FW_F4  = $(HOME)/STM32Cube/Repository/STM32Cube_FW_F4_V1.28.3
+# ---------------------------------------------------------------------------
+
+CROSS    ?= arm-none-eabi-
+CC        = $(CROSS)gcc
+AS        = $(CROSS)gcc -x assembler-with-cpp
+OBJCOPY   = $(CROSS)objcopy
+SIZE      = $(CROSS)size
+
+TOP          := $(abspath .)
+REPO_SIBLING := $(abspath $(TOP)/../..)
+WOLFSSL_ROOT ?= $(REPO_SIBLING)/wolfssl
+
+BOARD    ?= h5
+CONFIG   ?= bare
+TARGET   ?= test
+BUILD    ?= bare
+PQC      ?= 0
+STACK    ?= 0
+
+ifeq ($(filter $(BOARD),c031 h5 h573 h7 h7a3 h7s3 h723 u5 u3 u585 u545 u083 f207 f303 f437 f439 f767 wb55 wl55 g071 g474 g491 wba52 n657 c562 c5a3 l4a6 l552 l562),)
+  $(error BOARD must be one of: c031 | h5 | h573 | h7 | h7a3 | h7s3 | h723 | u5 | u3 | u585 | u545 | u083 | f207 | f303 | f437 | f439 | f767 | wb55 | wl55 | g071 | g474 | g491 | wba52 | n657 | c562 | c5a3 | l4a6 | l552 | l562)
+endif
+
+ifeq ($(filter $(CONFIG),c asm bare),)
+  $(error CONFIG must be one of: c | asm | bare)
+endif
+ifeq ($(filter $(TARGET),test bench dhuk stsaes ccb ccbhal c5rng c5sign cbonly),)
+  $(error TARGET must be one of: test | bench | dhuk | stsaes | ccb | ccbhal | c5rng | c5sign | cbonly)
+endif
+# c5rng: bare register-level STM32C5 HW-RNG conditioning probe (no wolfCrypt).
+# c5sign: bare STM32C5 PROTECTED ECDSA-sign probe driving ST's NIST P-256 CAVP
+# vector through the PKA registers directly, compared to ST's expected R,S.
+# Runs ST's CCB_RNG_Init / CONDRST + NIST sequence on live silicon and reports
+# the precise failure mode. C5 boards only.
+ifneq ($(filter $(TARGET),c5rng c5sign),)
+  ifeq ($(filter $(BOARD),c5a3 c562),)
+    $(error TARGET=$(TARGET) requires a C5 board: c5a3 | c562)
+  endif
+endif
+# stsaes: run ST's HAL SAES wrapped-key (DHUK) flow directly. Needs the
+# CubeMX HAL (HAL_CRYPEx_WrapKey/UnwrapKey), so force BUILD=cubemx.
+ifeq ($(TARGET),stsaes)
+  ifneq ($(BUILD),cubemx)
+    $(error TARGET=stsaes requires BUILD=cubemx)
+  endif
+endif
+# ccbhal: ST HAL CCB ECDSA reference (blob create -> public key -> sign) on the
+# U385. Used to confirm the CCB flow works on silicon and as a known-good
+# reference for the bare WOLFSSL_STM32_CCB port. The HAL CCB driver only exists
+# for U3, so force BUILD=cubemx and BOARD=u3.
+ifeq ($(TARGET),ccbhal)
+  ifneq ($(BUILD),cubemx)
+    $(error TARGET=ccbhal requires BUILD=cubemx)
+  endif
+  ifeq ($(filter $(BOARD),u3),)
+    $(error TARGET=ccbhal requires a CCB board: u3 (NUCLEO-U385RG-Q))
+  endif
+endif
+# BUILD axis: bare = direct-register board init + WOLFSSL_STM32_BARE
+#             cubemx = CubeMX/HAL board init + WOLFSSL_STM32_CUBEMX
+# The CONFIG axis is orthogonal (bare/asm/c controls the crypto path;
+# BUILD controls the board-bring-up + HAL-driver link surface).
+ifeq ($(filter $(BUILD),bare cubemx),)
+  $(error BUILD must be one of: bare | cubemx)
+endif
+# PQC axis: 0 = no post-quantum, 1 = enable ML-DSA + ML-KEM with the
+# small-memory variants (matches the wolfBoot resource-constrained
+# preset). Adds substantial code so small-flash boards (c031, g071,
+# u083) may overflow.
+ifeq ($(filter $(PQC),0 1),)
+  $(error PQC must be 0 or 1)
+endif
+# STACK axis: 0 = bench prints perf only (default; byte-identical to today).
+#             1 = bench prints per-algorithm peak stack + peak heap +
+#                 heap allocs alongside perf. Enables wolfssl's
+#                 HAVE_STACK_SIZE_VERBOSE + WOLFSSL_TRACK_MEMORY_VERBOSE +
+#                 USE_WOLFSSL_MEMORY. Adds a small RAM + code overhead.
+ifeq ($(filter $(STACK),0 1),)
+  $(error STACK must be 0 or 1)
+endif
+
+BUILD_DIR := $(TOP)/build/$(BOARD)-$(BUILD)-$(TARGET)-$(CONFIG)
+
+# ---- Per-board settings ----------------------------------------------------
+# Each board's config lives in boards/<BOARD>/board.mk (raw atoms; multi-
+# board families share boards/families/<fam>/family.mk). board-derive.mk
+# then computes the mechanical vars (MCU_FLAGS, CMSIS dirs, CPU_DEFS,
+# LDSCRIPT, STARTUP_S, BOARD_C_SRC, ...). A board.mk may set any of those
+# directly to override the derivation.
+include $(TOP)/boards/$(BOARD)/board.mk
+include $(TOP)/boards/common/board-derive.mk
+
+# ---- Variant overlays ------------------------------------------------------
+ifeq ($(CONFIG),bare)
+  VARIANT_DEFS := -DBUILD_BARE
+endif
+ifeq ($(CONFIG),c)
+  VARIANT_DEFS := -DBUILD_C
+endif
+ifeq ($(CONFIG),asm)
+  VARIANT_DEFS := -DBUILD_ASM
+endif
+
+# ---- BUILD axis: BARE vs CubeMX HAL ----------------------------------------
+# BUILD=bare keeps wolfcrypt on the direct-register path (WOLFSSL_STM32_BARE).
+# BUILD=cubemx pulls in ST's HAL drivers for clock/UART/GPIO + the crypto
+# HAL modules wolfcrypt's WOLFSSL_STM32_CUBEMX path drives (CRYP/HASH/RNG/
+# PKA). The wolfcrypt port_st_stm32.c code already handles both, so the only
+# Makefile delta is the HAL source-list + include path + the chip's
+# stm32<f>xx_hal_conf.h header.
+ifeq ($(BUILD),cubemx)
+  ifeq ($(HAL_FAMILY),)
+    $(error BUILD=cubemx not yet wired for BOARD=$(BOARD); needs HAL_FAMILY \
+            and boards/$(BOARD)/hw_init_cubemx.c. Currently supported: h7)
+  endif
+  BUILD_DEFS    := -DSTM32_BUILD_CUBEMX -DUSE_HAL_DRIVER
+ifeq ($(b_hal_newgen),1)
+  # New-generation HAL ("HAL2", e.g. STM32C5). The DFP layout and module set
+  # differ from the classic HAL, and the new-gen HAL has no classic crypto
+  # driver APIs -- so wolfcrypt stays on the register path (WOLFSSL_STM32_BARE,
+  # selected in user_settings.h via STM32_HAL_NEWGEN) and these HAL modules only
+  # bring up the board (clock/cache/NVIC). board.mk supplies HAL_SRC_DIR,
+  # HAL_INC_DIR, HAL_C_SRC (board-init modules + generated mx_*.c) and any
+  # HAL_EXTRA_INC (ll / timebases / generated headers).
+  HAL_C_SRC := $(wildcard $(HAL_C_SRC))
+else
+  HAL_DRIVER_DIR := $(CUBE_DIR)/Drivers/STM32$(HAL_FAMILY)_HAL_Driver
+  HAL_INC_DIR    := $(HAL_DRIVER_DIR)/Inc
+  HAL_SRC_DIR    := $(HAL_DRIVER_DIR)/Src
+  # Minimum HAL modules to bring up the board + crypto. Avoid pulling in
+  # peripherals we don't use (eth/dma2d/i2c/spi/...) to keep build small.
+  HAL_C_SRC := \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_cortex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_rcc.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_rcc_ex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_pwr.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_pwr_ex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_gpio.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_uart.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_uart_ex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_dma.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_dma_ex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_flash.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_flash_ex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_cryp.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_cryp_ex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_hash.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_hash_ex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_rng.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_rng_ex.c \
+    $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_pka.c
+  # CCB targets (U3 only) need the CCB HAL driver module: ccbhal is the raw HAL
+  # reference; ccb under cubemx routes the wolfSSL port through HAL_CCB.
+  ifneq ($(filter $(TARGET),ccb ccbhal),)
+    HAL_C_SRC += $(HAL_SRC_DIR)/stm32$(HAL_FAMILY_LC)_hal_ccb.c
+  endif
+  # Filter out any files that don't exist (different family packs ship
+  # different module subsets; e.g. STM32H7 has hash_ex but no pka, while
+  # STM32U5 has pka but not all the same ex modules).
+  HAL_C_SRC := $(wildcard $(HAL_C_SRC))
+endif
+else
+  BUILD_DEFS := -DSTM32_BUILD_BARE
+  HAL_C_SRC  :=
+endif
+
+# ---- Include paths ---------------------------------------------------------
+INCLUDES := \
+  -I$(TOP) \
+  -I$(TOP)/include \
+  -I$(TOP)/src \
+  -I$(CMSIS_CORE) \
+  -I$(CMSIS_DEVICE) \
+  -I$(WOLFSSL_ROOT)
+ifeq ($(BUILD),cubemx)
+  INCLUDES += -I$(HAL_INC_DIR) -I$(HAL_CONF_DIR) $(HAL_EXTRA_INC)
+endif
+
+# ---- Compile / link flags --------------------------------------------------
+# PQC=1 enables ML-DSA + ML-KEM with the small-memory variants. The
+# actual #defines (HAVE_DILITHIUM, WOLFSSL_DILITHIUM_*, WOLFSSL_HAVE_MLKEM,
+# WOLFSSL_MLKEM_*_SMALL_MEM) live in user_settings.h gated on
+# STM32_BARE_PQC.
+ifeq ($(PQC),1)
+  PQC_DEFS := -DSTM32_BARE_PQC
+else
+  PQC_DEFS :=
+endif
+
+# STACK=1 enables per-algorithm peak stack + peak heap reporting. The
+# actual #defines (USE_WOLFSSL_MEMORY, WOLFSSL_TRACK_MEMORY_VERBOSE,
+# HAVE_STACK_SIZE_VERBOSE) live in user_settings.h gated on
+# STM32_BARE_STACK_TRACK.
+ifeq ($(STACK),1)
+  STACK_DEFS := -DSTM32_BARE_STACK_TRACK
+else
+  STACK_DEFS :=
+endif
+
+# GCM=small selects the GCM_SMALL multiply (via gcm->H directly) instead of
+# the default GCM_TABLE_4BIT (via the gcm->M0 table). user_settings.h gates
+# the GCM impl on STM32_BARE_GCM_SMALL. Used by the DHUK GMAC cross-config
+# KAT: a correct table build must produce the same tag as the small build on
+# the same device key, which pins the GenerateM0() wiring in Stm32Dhuk_Gmac.
+ifeq ($(GCM),small)
+  GCM_DEFS := -DSTM32_BARE_GCM_SMALL
+else
+  GCM_DEFS :=
+endif
+
+COMMON_DEFS := -DWOLFSSL_USER_SETTINGS $(CPU_DEFS) $(VARIANT_DEFS) $(BUILD_DEFS) $(PQC_DEFS) $(STACK_DEFS) $(GCM_DEFS)
+
+CFLAGS    = $(MCU_FLAGS) $(INCLUDES) $(COMMON_DEFS) \
+            -O2 -fomit-frame-pointer \
+            -ffunction-sections -fdata-sections \
+            -Wall -Wno-unused-function -Wno-unused-variable \
+            -fno-common -fno-strict-aliasing \
+            -MMD -MP -std=gnu11
+
+ASFLAGS  := $(MCU_FLAGS) -c -g3
+
+# C031 has 32 KB flash -- float printf pulls in ~6 KB of FP support
+# from newlib-nano that we can't afford. Other boards keep it for
+# benchmark percent formatting.
+ifeq ($(BOARD),c031)
+  PRINTF_FLOAT_FLAG :=
+else
+  PRINTF_FLOAT_FLAG := -u _printf_float
+endif
+
+LDFLAGS  := $(MCU_FLAGS) \
+            -T$(LDSCRIPT) \
+            -Wl,-L,$(TOP)/boards/common \
+            --specs=nosys.specs --specs=nano.specs \
+            $(PRINTF_FLOAT_FLAG) \
+            -Wl,--gc-sections \
+            -Wl,-Map=$(BUILD_DIR)/app.map \
+            -Wl,--print-memory-usage
+
+LDLIBS   := -lc -lm
+
+# ---- Sources ---------------------------------------------------------------
+SRC_C  := \
+  src/main_$(TARGET).c \
+  src/stubs.c \
+  boards/common/board_common.c \
+  $(BOARD_C_SRC) \
+  $(HAL_C_SRC)
+
+SRC_ASM := $(STARTUP_S)
+
+# wolfCrypt -- compile the whole wolfcrypt/src tree; user_settings gates
+# what isn't needed. No HAL drivers under any CONFIG here -- BARE goes
+# direct-register; C is software-only.
+WC_SRC_DIR := $(WOLFSSL_ROOT)/wolfcrypt/src
+WC_ALL     := $(wildcard $(WC_SRC_DIR)/*.c)
+WC_EXCLUDE := \
+  $(WC_SRC_DIR)/evp.c \
+  $(WC_SRC_DIR)/misc.c \
+  $(WC_SRC_DIR)/selftest.c \
+  $(WC_SRC_DIR)/async.c \
+  $(WC_SRC_DIR)/wolfcrypt_first.c \
+  $(WC_SRC_DIR)/wolfcrypt_last.c \
+  $(WC_SRC_DIR)/fips.c \
+  $(WC_SRC_DIR)/fips_test.c
+
+WC_SRC := $(filter-out $(WC_EXCLUDE),$(WC_ALL)) \
+          $(WC_SRC_DIR)/port/st/stm32.c
+
+# Thumb2 inline-assembly ports (built unconditionally; macro-gated inside).
+# CONFIG=asm activates them via WOLFSSL_ARMASM in user_settings.h.
+WC_SRC += \
+  $(WC_SRC_DIR)/port/arm/thumb2-chacha-asm_c.c \
+  $(WC_SRC_DIR)/port/arm/thumb2-poly1305-asm_c.c \
+  $(WC_SRC_DIR)/port/arm/thumb2-curve25519_c.c \
+  $(WC_SRC_DIR)/port/arm/thumb2-sha512-asm_c.c \
+  $(WC_SRC_DIR)/port/arm/thumb2-aes-asm_c.c \
+  $(WC_SRC_DIR)/port/arm/thumb2-sha256-asm_c.c
+
+# MLKEM thumb2 ASM is only referenced by wc_mlkem_poly.c when
+# WOLFSSL_ARMASM is active AND ML-KEM is enabled. PQC=1 enables ML-KEM,
+# so wire it in only there. (thumb2-sha3-asm_c.c also exists upstream
+# but adding it unconditionally pushes wl55 over its 256 KB flash, so
+# SHA3 stays on the C path via WC_SHA3_NO_ASM in user_settings.h.)
+ifeq ($(PQC),1)
+  WC_SRC += $(WC_SRC_DIR)/port/arm/thumb2-mlkem-asm_c.c
+endif
+
+# Target entry point
+ifeq ($(TARGET),test)
+  # C031C6 has only 32 KB flash -- the wolfcrypt_test suite alone is
+  # ~30+ KB even with NO_RSA/NO_ECC/NO_DH. Skip test.c entirely on C031
+  # and rely on the main_test.c KAT block (SHA-256 + AES-CBC/ECB) as the
+  # validation surface.
+  ifneq ($(BOARD),c031)
+    SRC_C += $(WOLFSSL_ROOT)/wolfcrypt/test/test.c
+    COMMON_DEFS += -DRUN_WOLFCRYPT_TEST_SUITE
+  endif
+endif
+ifeq ($(TARGET),bench)
+  SRC_C += $(WOLFSSL_ROOT)/wolfcrypt/benchmark/benchmark.c
+endif
+# DHUK crypto-callback test app (GMAC + AES-ECB + ECDSA sign). The ECC
+# sign route requires SAES + DHUK + PKA together, so this target is
+# limited to the boards that carry all three (u3 = U385, u585 = U585,
+# u545 = U545). Other DHUK-only or PKA-less parts (e.g. u5 = U575, which
+# has neither SAES nor PKA) would fail to link. -DWOLFSSL_DHUK plus
+# -DWOLF_CRYPTO_CB enable the vendor-neutral DHUK device; the optional
+# exact-key unwrap primitive stays gated behind -DWOLFSSL_STM32_DHUK_UNWRAP.
+ifeq ($(TARGET),dhuk)
+  ifeq ($(filter $(BOARD),u3 u585 u545 c5a3 c562),)
+    $(error TARGET=dhuk requires a SAES+DHUK board: u3 u585 u545 c5a3 c562)
+  endif
+  COMMON_DEFS += -DWOLFSSL_DHUK
+  # DHUK routes through the wolfCrypt crypto-callback framework
+  # (the STM32 cryptocb device, wc_Stm32_DhukRegister), so WOLF_CRYPTO_CB is
+  # required.
+  COMMON_DEFS += -DWOLF_CRYPTO_CB
+  # DHUK_UNWRAP=1 opts into the real SAES wrapped-key DECRYPT path (the
+  # unwrap that lands a key in SAES KEYR). It only completes from secure
+  # state, so this is meant for a TZEN=1 board (e.g. the B-U585I-IOT02A,
+  # whose flash is secure-watermarked). Without it the default
+  # CRYPTOCB_UNAVAILABLE stubs are linked.
+  ifeq ($(DHUK_UNWRAP),1)
+    COMMON_DEFS += -DWOLFSSL_STM32_DHUK_UNWRAP
+  endif
+  # SECURE=1: build for a TZEN=1 part running in secure state. -mcmse
+  # makes the CMSIS device header resolve every peripheral (PWR/RCC/
+  # FLASH/GPIO/USART/SAES/PKA) to its secure alias (0x5xxx), which is
+  # mandatory once TrustZone is enabled -- the non-secure aliases the
+  # TZEN=0 build uses do not bring the clocks up from secure state.
+  # Code/data keep their default aliases; the SAU stays disabled (reset
+  # default = all-secure), so execution is already secure. Intended for
+  # the B-U585I-IOT02A (flash secure-watermarked, TZEN=0x1).
+  ifeq ($(SECURE),1)
+    COMMON_DEFS += -mcmse
+    LDFLAGS     += -mcmse
+  endif
+endif
+# CCB (Coupling and Chaining Bridge) test app -- STM32U3 only (u3 = U385). Brings
+# up the CCB and exercises the HW-protected DHUK->PKA ECDSA path; the CCB chains
+# PKA <-> SAES <-> RNG so the private key never enters software. Needs SAES + PKA
+# + DHUK + the CCB peripheral, which only the U3 carries. SECURE=1 builds for
+# TZEN=1 secure state (the fallback if CCB will not advance from non-secure).
+ifeq ($(TARGET),ccb)
+  ifeq ($(filter $(BOARD),u3 c5a3),)
+    $(error TARGET=ccb requires a CCB board: u3 (NUCLEO-U385RG-Q) or c5a3 (NUCLEO-C5A3ZG))
+  endif
+  COMMON_DEFS += -DWOLFSSL_DHUK -DWOLF_CRYPTO_CB -DWOLFSSL_STM32_CCB
+  ifeq ($(SECURE),1)
+    COMMON_DEFS += -mcmse
+    LDFLAGS     += -mcmse
+  endif
+endif
+# Crypto-callback-only test app -- exercises ECDSA sign/verify, full-payload
+# AES-GCM, HMAC-SHA256 and TRNG on hardware through the wolfCrypt crypto-callback
+# framework (the STM32 DHUK device), and turns on the STM32_BARE_CB_ONLY preset
+# that strips the software crypto so flash shrinks. The ECDSA sign route needs
+# SAES + DHUK + PKA together, so this is limited to the same boards as dhuk.
+ifeq ($(TARGET),cbonly)
+  ifeq ($(filter $(BOARD),u3 u585 u545 c5a3 c562),)
+    $(error TARGET=cbonly requires a SAES+DHUK board: u3 u585 u545 c5a3 c562)
+  endif
+  COMMON_DEFS += -DWOLFSSL_DHUK -DWOLF_CRYPTO_CB -DSTM32_BARE_CB_ONLY
+  ifeq ($(SECURE),1)
+    COMMON_DEFS += -mcmse
+    LDFLAGS     += -mcmse
+  endif
+endif
+
+ALL_C_SRC := $(SRC_C) $(WC_SRC)
+
+# ---- Object files ----------------------------------------------------------
+rel_obj = $(BUILD_DIR)/obj/$(subst /,__,$(patsubst /%,%,$(1))).o
+
+C_OBJ   := $(foreach s,$(ALL_C_SRC),$(call rel_obj,$(s)))
+ASM_OBJ := $(foreach s,$(SRC_ASM),$(call rel_obj,$(s)))
+OBJS    := $(C_OBJ) $(ASM_OBJ)
+DEPS    := $(OBJS:.o=.d)
+
+# ---- Targets ---------------------------------------------------------------
+.PHONY: all build flash size clean distclean size-report
+
+all: build
+
+build: $(BUILD_DIR)/app.bin $(BUILD_DIR)/app.hex size
+
+$(BUILD_DIR):
+	@mkdir -p $(BUILD_DIR)/obj
+
+define COMPILE_C_TEMPLATE
+$(call rel_obj,$(1)): $(1) | $(BUILD_DIR)
+	@echo "  CC   $$<"
+	@mkdir -p $$(@D)
+	@$(CC) $(CFLAGS) -c $$< -o $$@
+endef
+
+define COMPILE_ASM_TEMPLATE
+$(call rel_obj,$(1)): $(1) | $(BUILD_DIR)
+	@echo "  AS   $$<"
+	@mkdir -p $$(@D)
+	@$(AS) $(ASFLAGS) -c $$< -o $$@
+endef
+
+$(foreach s,$(ALL_C_SRC),$(eval $(call COMPILE_C_TEMPLATE,$(s))))
+$(foreach s,$(SRC_ASM),$(eval $(call COMPILE_ASM_TEMPLATE,$(s))))
+
+$(BUILD_DIR)/app.elf: $(OBJS) $(LDSCRIPT)
+	@echo "  LD   $@"
+	@$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+
+$(BUILD_DIR)/app.bin: $(BUILD_DIR)/app.elf
+	@echo "  BIN  $@"
+	@$(OBJCOPY) -O binary $< $@
+
+$(BUILD_DIR)/app.hex: $(BUILD_DIR)/app.elf
+	@$(OBJCOPY) -O ihex $< $@
+
+size: $(BUILD_DIR)/app.elf
+	@echo
+	@echo "----- size: $(BOARD)-$(TARGET)-$(CONFIG) -----"
+	@$(SIZE) $<
+
+ifeq ($(BOARD),n657)
+# N657 has no internal flash. Load .bin to AXISRAM2 (0x34000000) via OpenOCD,
+# extract initial SP/PC from the vector table, set MSP/MSPLIM/VTOR, resume.
+N657_SRAM_ADDR := 0x34000000
+flash: $(BUILD_DIR)/app.bin
+	@INIT_SP=$$(od -A n -t x4 -N 4 $< | awk '{print "0x"$$1}'); \
+	 ENTRY=$$(od -A n -j 4 -t x4 -N 4 $< | awk '{print "0x"$$1}'); \
+	 ENTRY_T=$$(printf "0x%08x" $$(( $$ENTRY | 1 ))); \
+	 echo "  N657 SRAM-load SP=$$INIT_SP entry=$$ENTRY_T"; \
+	 openocd -f interface/stlink.cfg \
+	     -c "adapter serial $(STLINK_SERIAL)" \
+	     -f target/$(OPENOCD_TARGET) \
+	     -c "init; reset halt; \
+	         load_image $< $(N657_SRAM_ADDR) bin; \
+	         reg msplim_s 0x00000000; \
+	         reg psplim_s 0x00000000; \
+	         reg msp $$INIT_SP; \
+	         mww 0xE000ED08 $(N657_SRAM_ADDR); \
+	         mww 0xE000ED28 0xFFFFFFFF; \
+	         resume $$ENTRY_T; \
+	         shutdown"
+else ifeq ($(BOARD),h7s3)
+# H7S3L8 has only 64 KB user flash (FSBL/CCB use) -- no main flash. Load
+# the .bin to AXI SRAM at 0x24000000 via OpenOCD load_image, then extract
+# the initial SP/PC from the vector table and resume. Cortex-M7 (no MSPLIM
+# register), so the M55-specific msplim_s writes from the N657 recipe are
+# omitted.
+H7S3_SRAM_ADDR := 0x24000000
+flash: $(BUILD_DIR)/app.bin
+	@INIT_SP=$$(od -A n -t x4 -N 4 $< | awk '{print "0x"$$1}'); \
+	 ENTRY=$$(od -A n -j 4 -t x4 -N 4 $< | awk '{print "0x"$$1}'); \
+	 ENTRY_T=$$(printf "0x%08x" $$(( $$ENTRY | 1 ))); \
+	 echo "  H7S3 SRAM-load SP=$$INIT_SP entry=$$ENTRY_T"; \
+	 openocd -f interface/stlink.cfg \
+	     -c "adapter serial $(STLINK_SERIAL)" \
+	     -f target/$(OPENOCD_TARGET) \
+	     -c "init; reset halt; \
+	         load_image $< $(H7S3_SRAM_ADDR) bin; \
+	         reg msp $$INIT_SP; \
+	         mww 0xE000ED08 $(H7S3_SRAM_ADDR); \
+	         resume $$ENTRY_T; \
+	         shutdown"
+else
+# Allow per-board overrides for OpenOCD binary and script search path
+# (C5 needs the ST CubeIDE binary because stm32c5x.cfg isn't in upstream
+# yet). Defaults are plain `openocd` from PATH and its built-in scripts.
+OPENOCD              ?= openocd
+OPENOCD_INTERFACE    ?= stlink.cfg
+OPENOCD_SCRIPTS_FLAG := $(if $(OPENOCD_SCRIPTS),-s $(OPENOCD_SCRIPTS),)
+CUBE_PROGRAMMER      ?= $(HOME)/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin/STM32_Programmer_CLI
+
+flash: $(BUILD_DIR)/app.elf
+ifdef USE_CUBE_PROGRAMMER
+	$(CUBE_PROGRAMMER) -c port=swd sn=$(STLINK_SERIAL) mode=UR \
+	    -d $< -v -hardRst
+else ifdef STLINK_SERIAL
+	$(OPENOCD) $(OPENOCD_SCRIPTS_FLAG) \
+	    -f interface/$(OPENOCD_INTERFACE) \
+	    -c "adapter serial $(STLINK_SERIAL)" \
+	    -f target/$(OPENOCD_TARGET) \
+	    -c "program $< verify reset exit"
+else
+	$(OPENOCD) $(OPENOCD_SCRIPTS_FLAG) \
+	    -f interface/$(OPENOCD_INTERFACE) -f target/$(OPENOCD_TARGET) \
+	    -c "program $< verify reset exit"
+endif
+endif
+
+size-report:
+	@echo "== STM32_Bare_Test size report =="
+	@for d in build/*; do \
+	  if [ -f $$d/app.elf ]; then \
+	    echo "--- $$d ---"; \
+	    $(SIZE) $$d/app.elf; \
+	  fi \
+	done
+
+clean:
+	rm -rf build/$(BOARD)-$(BUILD)-$(TARGET)-$(CONFIG)
+
+distclean:
+	rm -rf build
+
+-include $(DEPS)

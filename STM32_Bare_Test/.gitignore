@@ -1,0 +1,9 @@
+build/
+bench_logs/
+*.d
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
