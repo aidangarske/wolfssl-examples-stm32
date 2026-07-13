@@ -405,10 +405,18 @@ static int test_dhuk_cryptocb_cbc(void)
         0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a
     };
     static const byte zero_iv[16] = { 0 };
+    /* Two-block vector for the chained in-place decrypt regression below. */
+    static const byte pt2[32] = {
+        0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,
+        0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a,
+        0xae,0x2d,0x8a,0x57,0x1e,0x03,0xac,0x9c,
+        0x9e,0xb7,0x6f,0xac,0x45,0xaf,0x8e,0x51
+    };
     Aes  aes;
     byte ctEcb[16];
     byte ctCbc[16];
     byte rt[16];
+    byte buf2[32];
     int  ret;
 
     ret = wc_Stm32_DhukRegister(WC_DHUK_DEVID);
@@ -477,6 +485,48 @@ static int test_dhuk_cryptocb_cbc(void)
         goto cleanup;
     }
     printf("  cryptocb CBC round-trip OK\n");
+
+    /* Multi-block chained in-place CBC decrypt (regression for the chaining-IV
+     * fix). Split a two-block ciphertext across two in-place wc_AesCbcDecrypt
+     * calls so the second call depends on the chaining IV (aes->reg) that the
+     * first call must update. In-place decrypt overwrites the input block with
+     * plaintext, so the wrapper has to save the ciphertext block for the next
+     * IV; reading it back from the overwritten input corrupts block 1. */
+    ret = wc_AesInit(&aes, NULL, WC_DHUK_DEVID);
+    if (ret == 0) {
+        ret = wc_AesSetKey(&aes, seedA, 32, zero_iv, AES_ENCRYPTION);
+    }
+    if (ret == 0) {
+        /* Encrypt straight into buf2; it is decrypted in place below. */
+        ret = wc_AesCbcEncrypt(&aes, buf2, pt2, (word32)sizeof(pt2));
+    }
+    wc_AesFree(&aes);
+    if (ret != 0) {
+        printf("  cryptocb CBC 2-block encrypt failed: %d\n", ret);
+        goto cleanup;
+    }
+    ret = wc_AesInit(&aes, NULL, WC_DHUK_DEVID);
+    if (ret == 0) {
+        ret = wc_AesSetKey(&aes, seedA, 32, zero_iv, AES_DECRYPTION);
+    }
+    if (ret == 0) {
+        ret = wc_AesCbcDecrypt(&aes, buf2, buf2, 16);         /* block 0 */
+    }
+    if (ret == 0) {
+        ret = wc_AesCbcDecrypt(&aes, buf2 + 16, buf2 + 16, 16); /* block 1 */
+    }
+    wc_AesFree(&aes);
+    if (ret != 0) {
+        printf("  cryptocb CBC chained in-place decrypt failed: %d\n", ret);
+        goto cleanup;
+    }
+    if (XMEMCMP(pt2, buf2, sizeof(pt2)) != 0) {
+        printf("  cryptocb CBC chained in-place decrypt mismatch -- FAIL "
+               "(chaining IV corrupted)\n");
+        ret = -1;
+        goto cleanup;
+    }
+    printf("  cryptocb CBC chained in-place decrypt OK\n");
 
 #ifdef WOLFSSL_AES_COUNTER
     /* Negative: AES-CTR is not serviceable for a DHUK key. It must now return a
