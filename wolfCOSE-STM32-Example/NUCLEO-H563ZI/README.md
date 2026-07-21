@@ -8,7 +8,7 @@ Pre-configured STM32CubeMX project for wolfCOSE on NUCLEO-H563ZI. Verified on re
 2. Open `NUCLEO-H563ZI-wolfCOSE.ioc` in STM32CubeMX (already configured, do not create your own)
 3. Generate code (Project -> Generate Code)
 4. Apply the software-crypto conf edit and add the main.c glue (seed, printf, fflush) from the parent README
-5. Build: `make GCC_PATH=/path/to/STM32CubeIDE-arm-toolchain/bin`
+5. Build: `make GCC_PATH=/path/to/STM32CubeIDE/.../gnu-tools-for-stm32/tools/bin`
 6. Flash and open the ST-LINK VCP at 115200 baud
 
 ## Expected Output
