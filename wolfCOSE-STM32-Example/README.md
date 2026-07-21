@@ -1,124 +1,132 @@
 # wolfCOSE STM32 CubeMX Example
 
-This directory contains a pre-configured STM32CubeMX project that uses the wolfCOSE CMSIS pack, a zero-allocation CBOR (RFC 8949) and COSE (RFC 9052/9053) library built on wolfCrypt. It runs a COSE_Sign1 ES256 self test on the device and prints the result over UART.
+This directory contains a pre-configured STM32CubeMX project that uses the wolfCOSE CMSIS pack, a zero-allocation CBOR (RFC 8949) and COSE (RFC 9052/9053) library built on wolfCrypt. It runs a COSE_Sign1 ES256 sign and verify self test on the device and prints the result over UART. This example was built and verified on real NUCLEO-H563ZI hardware.
 
 The wolfCOSE CMSIS pack is hosted at wolfSSL: <https://www.wolfssl.com/files/ide/I-CUBE-wolfCOSE.pack>
 It depends on the wolfSSL pack: <https://www.wolfssl.com/files/ide/I-CUBE-wolfSSL.pack>
 
 ## Supported Boards
 
-Any STM32 with a UART (for test output) and RNG (for signing entropy):
-- STM32F4 series (F407, F429, F439, F469, etc.)
-- STM32F7 series (F746, F767, F769, etc.)
-- STM32H5 series (H563, H573, etc.)
-- STM32H7 series (H743, H753, H747, etc.)
+- NUCLEO-H563ZI (the provided `.ioc`). Any STM32 with a UART and RNG works; see "Other STM32 boards" below.
 
 ## Quick Start
 
 ### Step 1: Install the Packs
 
 1. Download the wolfSSL pack from <https://www.wolfssl.com/files/ide/I-CUBE-wolfSSL.pack> and the wolfCOSE pack from <https://www.wolfssl.com/files/ide/I-CUBE-wolfCOSE.pack>
-2. Open STM32CubeMX
-3. Go to **Help -> Manage Embedded Software Packages**
-4. Click **From Local...** and install the wolfSSL pack, then the wolfCOSE pack
-5. Accept the license agreements
+2. In STM32CubeMX, go to **Help -> Manage Embedded Software Packages -> From Local...** and install the wolfSSL pack, then the wolfCOSE pack.
 
-### Step 2: Create Your Project
+### Step 2: Open the Provided Project
 
-1. Create a new project for your STM32 board (or use a pre-configured .ioc from the board-specific subdirectory)
-2. Configure **Connectivity -> USART3** (the ST-LINK virtual COM port on NUCLEO boards):
-   - Mode: **Asynchronous**, 115200 baud (printf output)
-3. Configure **Security -> RNG**:
-   - Enable the true random number generator (CRITICAL - signing entropy)
-4. Configure **Software Packs -> Select Components**:
-   - Expand wolfSSL.I-CUBE-wolfSSL, check **wolfCrypt Core** (required)
-   - Expand wolfSSL.I-CUBE-wolfCOSE, check **Core** (required) and **Test** (the self test)
-5. Click **Generate Code** (Makefile recommended for command-line builds)
+1. Open `NUCLEO-H563ZI/NUCLEO-H563ZI-wolfCOSE.ioc` in STM32CubeMX (do not create your own; USART3, RNG, clocks, and both pack components are already configured).
+2. Click **Generate Code** (Makefile toolchain is preselected).
 
-**Note:** This example uses software crypto (SP math) with entropy from the RNG peripheral, so the STM32 hardware hash accelerator is not involved. Use the provided `NUCLEO-H563ZI/user_settings.h` for a known-good software configuration (ECC P-256 + SHA-256 for ES256).
+### Step 3: Use Software Crypto (STM32H5 workaround)
 
-### Step 3: Add wolfCOSE Code
-
-Add the callbacks to your `main.c` (entropy from the TRNG, printf over USART3):
+The wolfSSL pack enables the STM32H5 hardware hash by default, which currently mis-references a HAL enum on the H5. Use software crypto instead. In the generated `wolfSSL/wolfSSL.I-CUBE-wolfSSL_conf.h`, inside the `#elif defined(STM32H563xx)` block, comment out the hardware-crypto lines:
 
 ```c
-/* USER CODE BEGIN 0 */
-/* wolfSSL user_settings.h sets CUSTOM_RAND_GENERATE_BLOCK to this. */
-int custom_rand_gen_block(unsigned char* output, unsigned int sz)
+    // #define WOLFSSL_STM32H5
+    // #define STM32_HAL_V2
+    // #undef  NO_STM32_HASH
+    // #define WOLFSSL_STM32_PKA
+```
+
+Then add the TRNG seed hook at the end of that same file:
+
+```c
+extern int wolfCOSE_stm32_seed(unsigned char* output, unsigned int sz);
+#undef  CUSTOM_RAND_GENERATE_SEED
+#define CUSTOM_RAND_GENERATE_SEED wolfCOSE_stm32_seed
+```
+
+### Step 4: Add the Glue to main.c
+
+In the `USER CODE BEGIN Includes` section:
+
+```c
+#include <stdio.h>
+extern int wolfCOSETest(void);
+```
+
+In `USER CODE BEGIN 2` (in `main()`, after the peripherals are initialized):
+
+```c
+printf("\r\n== wolfCOSE NUCLEO-H563ZI ==\r\n");
+wolfCOSETest();
+fflush(stdout);
+```
+
+In `USER CODE BEGIN 4` (entropy from the TRNG and printf over USART3):
+
+```c
+int wolfCOSE_stm32_seed(unsigned char* output, unsigned int sz)
 {
     extern RNG_HandleTypeDef hrng;
-    uint32_t rnd;
-    unsigned int chunk;
-    unsigned int i = 0;
+    uint32_t rnd = 0;
+    unsigned int i;
 
-    while (i < sz) {
-        if (HAL_RNG_GenerateRandomNumber(&hrng, &rnd) != HAL_OK) {
-            return -1;
+    for (i = 0; i < sz; i++) {
+        if ((i & 3u) == 0u) {
+            if (HAL_RNG_GenerateRandomNumber(&hrng, &rnd) != HAL_OK) {
+                return -1;
+            }
         }
-        chunk = (sz - i < 4u) ? (sz - i) : 4u;
-        memcpy(output + i, &rnd, chunk);
-        i += chunk;
+        output[i] = (unsigned char)(rnd >> ((i & 3u) * 8u));
     }
     return 0;
 }
 
-/* Retarget printf to USART3 (ST-LINK VCP). */
 int __io_putchar(int ch)
 {
-    extern UART_HandleTypeDef huart3;
     (void)HAL_UART_Transmit(&huart3, (uint8_t*)&ch, 1, HAL_MAX_DELAY);
     return ch;
 }
-/* USER CODE END 0 */
 ```
 
-In main() after the peripherals are initialized:
-```c
-/* USER CODE BEGIN 2 */
-extern int wolfCOSETest(void);
-wolfCOSETest();
-/* USER CODE END 2 */
+`fflush(stdout)` matters: newlib block-buffers stdout on embedded, so without it the `PASS` line stays in the buffer and never reaches the UART.
+
+### Step 5: Build and Run
+
+Build with the STM32CubeIDE toolchain (its arm-none-eabi-gcc includes newlib; a bare Homebrew arm-none-eabi-gcc fails on `math.h`):
+
+```bash
+make GCC_PATH=/path/to/STM32CubeIDE/.../gnu-tools-for-stm32/tools/bin
 ```
 
-### Step 4: Build and Test
-
-1. Build your project
-2. Flash to your board
-3. Open the ST-LINK virtual COM port at 115200 baud
-4. Expected output:
+Flash (STM32CubeIDE, STM32CubeProgrammer, or OpenOCD), open the ST-LINK virtual COM port at 115200 baud, and reset the board. Expected output:
 
 ```
+== wolfCOSE NUCLEO-H563ZI ==
 Running wolfCOSE test (COSE_Sign1 ES256)...
 wolfCOSE test: PASS (COSE_Sign1 99 bytes)
 ```
 
+That is a real COSE_Sign1 ES256 message signed and verified on the Cortex-M33, using software SP-math ECC and TRNG entropy.
+
+## Other STM32 boards
+
+The provided `.ioc` is specific to the NUCLEO-H563ZI (its pins and clocks). For a different STM32 (F4, F7, H7, etc.):
+
+1. Create a new project for your board, enable a UART for output and the RNG peripheral.
+2. Add the wolfSSL `wolfCrypt Core` and wolfCOSE `Core` + `Test` components, and generate.
+3. Add the same Step 4 glue (point `__io_putchar` at your board's UART handle).
+4. The Step 3 software-crypto edit is only needed on the STM32H5; on other families the wolfSSL pack's default crypto config builds as-is.
+
 ## Troubleshooting
 
 ### No UART output
-- Verify USART3 pins/baud and the `__io_putchar` retarget
-- Confirm the terminal is on the ST-LINK VCP at 115200 baud
+- Confirm the terminal is on the ST-LINK VCP at 115200 baud.
+- Ensure `fflush(stdout)` follows `wolfCOSETest()` and `__io_putchar` targets the right UART handle.
 
-### Build errors about missing headers
-- Ensure both **wolfCrypt Core** and **wolfCOSE Core** are checked in Software Packs
+### `HASH_ALGOSELECTION_SHA256` undeclared (build error)
+- The STM32H5 hardware-hash block is still active; apply the Step 3 edit.
 
-### RNG failure or sign returns nonzero
-- Enable the RNG peripheral in CubeMX and wire `custom_rand_gen_block` to it (`hrng` must be initialized)
+### `wc_GenerateSeed()` error or RNG failure
+- The TRNG seed hook (Step 3) or the seed function (Step 4) is missing, or the RNG peripheral is not enabled.
 
-### math.h not found (command-line build)
-- Build with the STM32CubeIDE toolchain (`make GCC_PATH=<CubeIDE tools/bin>`); a bare arm-none-eabi-gcc without newlib fails here
-
-## Features
-
-- **Zero dynamic memory** - all operations run on caller-provided buffers
-- **Post-quantum ready** - ES256 by default, ML-DSA available (RFC 9964)
-- **Software crypto** - portable SP math, no STM32 hardware hash dependency
-- **Self test** - one-call `wolfCOSETest()` from the pack Test component
-
-## Resources
-
-- [wolfCOSE GitHub](https://github.com/wolfSSL/wolfCOSE)
-- [wolfCOSE STM32Cube Guide](https://github.com/wolfSSL/wolfCOSE/wiki/STM32Cube)
-- [wolfSSL Support](mailto:support@wolfssl.com)
+### `math.h: No such file` (command-line build)
+- Build with the STM32CubeIDE toolchain via `GCC_PATH`; a newlib-less arm-none-eabi-gcc cannot build it.
 
 ## License
 
