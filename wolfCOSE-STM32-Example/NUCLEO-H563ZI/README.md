@@ -8,9 +8,10 @@ depend on the STM32 hardware hash accelerator.
 ## Prerequisites
 
 - STM32CubeMX and STM32CubeIDE (or `make` with an arm-none-eabi toolchain).
-- The wolfSSL pack (`I-CUBE-wolfSSL` 5.9.2 or later) and the wolfCOSE pack
-  (`I-CUBE-wolfCOSE`), installed from
-  [wolfssl.com/files/ide](https://www.wolfssl.com/files/ide/).
+- The wolfSSL pack
+  ([I-CUBE-wolfSSL.pack](https://www.wolfssl.com/files/ide/I-CUBE-wolfSSL.pack),
+  5.9.2 or later) and the wolfCOSE pack
+  ([I-CUBE-wolfCOSE.pack](https://www.wolfssl.com/files/ide/I-CUBE-wolfCOSE.pack)).
 
 ## Steps
 

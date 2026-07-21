@@ -3,9 +3,10 @@
 STM32Cube examples that run wolfCOSE (CBOR/COSE on wolfCrypt) on hardware.
 
 wolfCOSE is delivered as an STM32Cube pack, `I-CUBE-wolfCOSE`, alongside the
-wolfSSL pack it depends on. Install both from
-[wolfssl.com/files/ide](https://www.wolfssl.com/files/ide/), then follow a board
-example below.
+wolfSSL pack it depends on. Install both from wolfssl.com/files/ide
+([I-CUBE-wolfSSL.pack](https://www.wolfssl.com/files/ide/I-CUBE-wolfSSL.pack),
+[I-CUBE-wolfCOSE.pack](https://www.wolfssl.com/files/ide/I-CUBE-wolfCOSE.pack)),
+then follow a board example below.
 
 ## Boards
 
